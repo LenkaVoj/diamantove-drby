@@ -212,7 +212,7 @@ function submitAnswer(choice) {
     els.scorePill.textContent = data.total_score + ' b';
     updateRankPill(data.rank, data.total_teams);
     if (data.milestone) { showMilestone(data.milestone_count); }
-    const delay = data.milestone ? (MILESTONE_DURATION + 300) : 1900;
+    const delay = data.milestone ? (MILESTONE_DURATION + 300) : 4000;
     setTimeout(() => {
       if (data.finished) { window.location.href = '/result'; }
       else { loadQuestion(); }
