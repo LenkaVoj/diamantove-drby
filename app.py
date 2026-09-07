@@ -118,3 +118,218 @@ def current_rank(team_id):
     (finished or still playing), based on points earned up to this moment.
     This is a live/informal standing shown to a team while it is still
     playing — not the same as the final /board ranking, which only lists
+    teams once they've completed all questions."""
+    ranked = sorted(
+        TEAMS.values(),
+        key=lambda t: (-t["total_score"], -t["idx"]),
+    )
+    total = len(ranked)
+    for i, t in enumerate(ranked, start=1):
+        if t["id"] == team_id:
+            return i, total
+    return None, total
+
+
+@app.route("/api/question")
+def api_question():
+    team = get_team()
+    if not team:
+        return jsonify({"error": "no-session"}), 401
+    if team["finished"] or team["idx"] >= N:
+        return jsonify({"finished": True})
+    idx = team["idx"]
+    q = QUESTIONS[idx]
+    if team["q_started_at"] is None:
+        team["q_started_at"] = time.time()
+        save_teams()
+    omap = option_map_for(team["id"], idx)
+    options = [
+        {"key": "left", "text": q[omap["left"]]},
+        {"key": "right", "text": q[omap["right"]]},
+    ]
+    rank, total_teams = current_rank(team["id"])
+    return jsonify({
+        "finished": False,
+        "index": idx,
+        "total": N,
+        "topic": q["topic"],
+        "text": q["q"],
+        "options": options,
+        "score_so_far": team["total_score"],
+        "rank": rank,
+        "total_teams": total_teams,
+    })
+
+
+@app.route("/api/answer", methods=["POST"])
+def api_answer():
+    team = get_team()
+    if not team:
+        return jsonify({"error": "no-session"}), 401
+    if team["finished"] or team["idx"] >= N:
+        return jsonify({"error": "already-finished"}), 400
+    data = request.get_json(force=True)
+    choice = data.get("choice")
+    if choice not in ("left", "right"):
+        return jsonify({"error": "bad-choice"}), 400
+
+    idx = team["idx"]
+    q = QUESTIONS[idx]
+    started = team["q_started_at"] or time.time()
+    elapsed = max(0.0, time.time() - started)
+
+    omap = option_map_for(team["id"], idx)
+    chosen_letter = omap[choice]
+    correct = (chosen_letter == q["correct"])
+
+    bonus = 0
+    if correct:
+        frac = max(0.0, 1 - (elapsed / TIME_LIMIT))
+        bonus = round(BONUS_MAX * frac)
+    score_gained = (BASE_SCORE + bonus) if correct else 0
+
+    team["answers"].append({
+        "idx": idx, "correct": correct, "elapsed": round(elapsed, 2),
+        "score_gained": score_gained,
+    })
+    team["total_score"] += score_gained
+    team["total_time"] += elapsed
+    team["idx"] += 1
+    team["q_started_at"] = None
+
+    finished_now = team["idx"] >= N
+    if finished_now:
+        team["finished"] = True
+        team["finished_at"] = time.time()
+
+    # Every 5th correct answer (cumulative, not a streak) triggers a
+    # celebratory animation on the client — purely cosmetic, doesn't
+    # affect scoring.
+    n_correct_total = sum(1 for a in team["answers"] if a["correct"])
+    milestone = correct and n_correct_total % 5 == 0
+
+    save_teams()
+    rank, total_teams = current_rank(team["id"])
+    return jsonify({
+        "correct": correct,
+        "note": q["note"],
+        "score_gained": score_gained,
+        "total_score": team["total_score"],
+        "finished": finished_now,
+        "rank": rank,
+        "total_teams": total_teams,
+        "milestone": milestone,
+        "milestone_count": n_correct_total,
+    })
+
+
+def team_path(team):
+    pts = []
+    all_correct = True
+    for a in team["answers"]:
+        i = a["idx"]
+        if a["correct"]:
+            pts.append(DIAMOND_PTS[i])
+        else:
+            pts.append(WRONG_PTS[i])
+            all_correct = False
+    return pts, all_correct
+
+
+@app.route("/result")
+def result_page():
+    if not get_team():
+        return redirect(url_for("join_page"))
+    return render_template("result.html")
+
+
+@app.route("/api/result")
+def api_result():
+    team = get_team()
+    if not team:
+        return jsonify({"error": "no-session"}), 401
+    if not team["finished"]:
+        return jsonify({"finished": False})
+    pts, all_correct = team_path(team)
+    n_correct = sum(1 for a in team["answers"] if a["correct"])
+    return jsonify({
+        "finished": True,
+        "name": team["name"],
+        "total_score": team["total_score"],
+        "total_time": round(team["total_time"], 1),
+        "n_correct": n_correct,
+        "n_total": N,
+        "all_correct": all_correct,
+        "path": pts,
+    })
+
+
+@app.route("/board")
+def board_page():
+    return render_template("board.html")
+
+
+@app.route("/admin")
+def admin_page():
+    return render_template("admin.html")
+
+
+@app.route("/api/leaderboard")
+def api_leaderboard():
+    finished = [t for t in TEAMS.values() if t["finished"]]
+    finished.sort(key=lambda t: (-t["total_score"], t["total_time"]))
+    out = []
+    for rank, t in enumerate(finished, start=1):
+        pts, all_correct = team_path(t)
+        n_correct = sum(1 for a in t["answers"] if a["correct"])
+        out.append({
+            "rank": rank,
+            "name": t["name"],
+            "total_score": t["total_score"],
+            "total_time": round(t["total_time"], 1),
+            "n_correct": n_correct,
+            "n_total": N,
+            "all_correct": all_correct,
+            "path": pts,
+            "finished_at": t["finished_at"],
+        })
+    in_progress = sum(1 for t in TEAMS.values() if not t["finished"])
+    return jsonify({"teams": out, "in_progress": in_progress, "n_total_questions": N})
+
+
+ADMIN_KEY = os.environ.get("ADMIN_KEY")  # optional: set this env var on the host to protect /reset
+
+
+@app.route("/api/admin/reset", methods=["POST"])
+def api_reset():
+    """Wipe all teams — organizer-only, call manually between runs of the game.
+    If ADMIN_KEY is set (recommended for a public cloud deploy), the same
+    value must be passed as ?key=... or it's rejected."""
+    if ADMIN_KEY and request.args.get("key") != ADMIN_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    global TEAMS
+    TEAMS = {}
+    save_teams()
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    if "PORT" in os.environ:
+        print("Diamantove drby server starting on port", port)
+    else:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+        except Exception:
+            local_ip = "127.0.0.1"
+        finally:
+            s.close()
+        print("=" * 60)
+        print(" Diamantové drby — server běží")
+        print(f" Týmy se připojí na:  http://{local_ip}:{port}")
+        print(f" Promítání výsledků:  http://{local_ip}:{port}/board")
+        print("=" * 60)
+    app.run(host="0.0.0.0", port=port, debug=False)
